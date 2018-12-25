@@ -8,7 +8,7 @@ use crate::service::Service;
 use solana_metrics::{influxdb, submit};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::timing;
-use solana_sdk::vote_program::{self, VoteProgram};
+use solana_sdk::vote_program::VoteProgram;
 use std::result;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -43,14 +43,12 @@ impl ComputeLeaderConfirmationService {
             .accounts_db
             .read()
             .unwrap()
-            .accounts
-            .values()
+            .get_vote_accounts()
+            .iter()
             .filter_map(|account| {
-                if vote_program::check_id(&account.owner) {
-                    if let Ok(vote_state) = VoteProgram::deserialize(&account.userdata) {
-                        if leader_id != vote_state.node_id {
-                            return Some(vote_state);
-                        }
+                if let Ok(vote_state) = VoteProgram::deserialize(&account.userdata) {
+                    if leader_id != vote_state.node_id {
+                        return Some(vote_state);
                     }
                 }
                 None

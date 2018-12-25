@@ -3,15 +3,22 @@ use crate::bank::Result;
 use crate::checkpoint::Checkpoint;
 use crate::counter::Counter;
 use crate::status_deque::{StatusDeque, StatusDequeError};
-use bincode::serialize;
+use bincode::{self, deserialize_from, serialize, serialize_into, serialized_size};
 use hashbrown::{HashMap, HashSet};
 use log::Level;
+use memmap::MmapMut;
 use solana_sdk::account::Account;
 use solana_sdk::hash::{hash, Hash};
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::transaction::Transaction;
+use solana_sdk::vote_program;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::fs::{create_dir_all, remove_dir_all, rename, File, OpenOptions};
+use std::io::prelude::*;
+use std::io::{self, Seek, SeekFrom};
+use std::mem::size_of;
+use std::path::Path;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex, RwLock};
 
@@ -30,13 +37,144 @@ pub struct ErrorCounters {
     pub missing_signature_for_fee: usize,
 }
 
+//
+// A persistent account is 2 files:
+//  account_path/--+
+//                 +-- data  <== concatenated instances of
+//                                    usize length
+//                                    account data
+
+const ACCOUNT_PATHS: [&str; 2] = ["/media/nvme0/accounts", "/media/nvme1/accounts"];
+const ACCOUNT_DATA_FILE: &str = "data";
+
+// Start accounts size to be mmaped
+const DATA_FILE_START_SIZE: u64 = 64 * 1024 * 1024;
+const DATA_FILE_INC_SIZE: u64 = 4 * 1024 * 1024;
+
+const SIZEOF_USIZE: usize = size_of::<usize>();
+
+#[allow(clippy::needless_pass_by_value)]
+fn err_bincode_to_io(e: Box<bincode::ErrorKind>) -> io::Error {
+    io::Error::new(io::ErrorKind::Other, e.to_string())
+}
+
+fn to_dir_index(n: u8) -> usize {
+    (n >> 7) as usize
+}
+
+macro_rules! get_path_main {
+    ($path: expr) => {{
+        format!("{}/{}/main", $path, std::process::id())
+    }};
+}
+
+macro_rules! get_path_checkpoint {
+    ($path: expr, $count: expr) => {{
+        format!("{}/{}/chk/{}", $path, std::process::id(), $count)
+    }};
+}
+
+#[derive(Debug)]
+pub struct AccountRW {
+    data: File,
+    map: MmapMut,
+    current_offset: u64,
+    file_size: u64,
+}
+
+impl AccountRW {
+    pub fn new(account_path: &str, create: bool) -> Self {
+        let path = get_path_main!(account_path);
+        let path = Path::new(&path);
+
+        if create {
+            let _ignored = remove_dir_all(path);
+            create_dir_all(path).expect("Create directory failed");
+        }
+
+        let mut data = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(create)
+            .open(path.join(ACCOUNT_DATA_FILE))
+            .expect("Unable to open account data");
+
+        data.seek(SeekFrom::Start(DATA_FILE_START_SIZE)).unwrap();
+        data.write_all(&[0]).unwrap();
+        data.seek(SeekFrom::Start(0)).unwrap();
+        data.flush().unwrap();
+        let map = unsafe { MmapMut::map_mut(&data).expect("failed to map the data file") };
+
+        AccountRW {
+            data,
+            map,
+            current_offset: 0,
+            file_size: DATA_FILE_START_SIZE,
+        }
+    }
+
+    fn usize_at(&self, at: usize) -> io::Result<usize> {
+        deserialize_from(&self.map[at..at + SIZEOF_USIZE]).map_err(err_bincode_to_io)
+    }
+
+    fn grow_file(&mut self) -> io::Result<()> {
+        let end = self.file_size + DATA_FILE_INC_SIZE;
+        drop(&self.map);
+        self.data.seek(SeekFrom::Start(end))?;
+        self.data.write_all(&[0])?;
+        self.data.seek(SeekFrom::Start(0))?;
+        self.data.flush()?;
+        self.map = unsafe { MmapMut::map_mut(&self.data)? };
+        self.file_size = end;
+        Ok(())
+    }
+
+    pub fn get_account(&self, index: usize) -> io::Result<Account> {
+        let len = self.usize_at(index)?;
+        let at = index + SIZEOF_USIZE;
+        deserialize_from(&self.map[at..at + len]).map_err(err_bincode_to_io)
+    }
+
+    pub fn write_account(&mut self, account: &Account, offset: usize) -> io::Result<(usize)> {
+        let len = serialized_size(&account).map_err(err_bincode_to_io)? as usize;
+        let mut data_at: usize = offset;
+
+        if offset == std::usize::MAX {
+            data_at = self.current_offset as usize;
+            self.current_offset = (data_at + len + SIZEOF_USIZE) as u64;
+            if self.current_offset >= self.file_size {
+                self.grow_file()?;
+            }
+        } else {
+            let cur_len = self.usize_at(data_at)?;
+            assert!(cur_len >= len);
+        }
+        serialize_into(&mut self.map[data_at..], &len).map_err(err_bincode_to_io)?;
+        serialize_into(&mut self.map[data_at + SIZEOF_USIZE..], &account)
+            .map_err(err_bincode_to_io)?;
+
+        Ok(data_at)
+    }
+}
+
 /// This structure handles the load/store of the accounts
 pub struct AccountsDB {
-    /// Mapping of known public keys/IDs to accounts
-    pub accounts: HashMap<Pubkey, Account>,
+    /// Mapping of known public keys/IDs to index into file
+    index: Vec<HashMap<Pubkey, usize>>,
+
+    /// Mapping of vote account public keys/IDs to index into file
+    vote_index: Vec<HashMap<Pubkey, usize>>,
+
+    /// Persistent account storage
+    accounts_rw: Vec<AccountRW>,
 
     /// list of prior states
-    checkpoints: VecDeque<(HashMap<Pubkey, Account>, u64)>,
+    checkpoints: VecDeque<(
+        Vec<HashMap<Pubkey, usize>>,
+        Vec<HashMap<Pubkey, usize>>,
+        Vec<AccountRW>,
+        u64,
+    )>,
 
     /// The number of transactions the bank has processed without error since the
     /// start of the ledger.
@@ -51,49 +189,82 @@ pub struct Accounts {
     account_locks: Mutex<HashSet<Pubkey>>,
 }
 
-impl Default for AccountsDB {
-    fn default() -> Self {
-        Self {
-            accounts: HashMap::new(),
-            checkpoints: VecDeque::new(),
-            transaction_count: 0,
-        }
-    }
-}
-
 impl Default for Accounts {
     fn default() -> Self {
         Self {
             account_locks: Mutex::new(HashSet::new()),
-            accounts_db: RwLock::new(AccountsDB::default()),
+            accounts_db: RwLock::new(AccountsDB::new()),
         }
     }
 }
 
 impl AccountsDB {
+    pub fn new() -> AccountsDB {
+        let mut index: Vec<HashMap<Pubkey, usize>> = vec![];
+        let mut vote_index: Vec<HashMap<Pubkey, usize>> = vec![];
+        let mut accounts_rw: Vec<AccountRW> = vec![];
+        ACCOUNT_PATHS.into_iter().for_each(|p| {
+            accounts_rw.push(AccountRW::new(p, true));
+            index.push(HashMap::new());
+            vote_index.push(HashMap::new());
+        });
+        AccountsDB {
+            index,
+            vote_index,
+            accounts_rw,
+            checkpoints: VecDeque::new(),
+            transaction_count: 0,
+        }
+    }
+
+    pub fn get_vote_accounts(&self) -> Vec<Account> {
+        let mut accounts: Vec<Account> = vec![];
+        for (dir, index) in self.vote_index.iter().enumerate() {
+            let reader = &self.accounts_rw[dir];
+            for (_, offset) in index.iter() {
+                let account = reader.get_account(*offset).unwrap();
+                accounts.push(account.clone());
+            }
+        }
+        accounts
+    }
+
     pub fn keys(&self) -> Vec<Pubkey> {
-        self.accounts.keys().cloned().collect()
+        let mut pubkeys: Vec<Pubkey> = vec![];
+        for index in self.index.iter() {
+            pubkeys.extend(index.keys().cloned());
+        }
+        pubkeys
     }
 
     pub fn hash_internal_state(&self) -> Hash {
         let mut ordered_accounts = BTreeMap::new();
 
         // only hash internal state of the part being voted upon, i.e. since last
-        //  checkpoint
-        for (pubkey, account) in &self.accounts {
-            ordered_accounts.insert(*pubkey, account.clone());
+        // checkpoint
+        for (dir, index) in self.index.iter().enumerate() {
+            let reader = &self.accounts_rw[dir];
+            for (pubkey, offset) in index.iter() {
+                let account = reader.get_account(*offset).unwrap();
+                ordered_accounts.insert(*pubkey, account.clone());
+            }
         }
 
         hash(&serialize(&ordered_accounts).unwrap())
     }
 
-    fn load(&self, pubkey: &Pubkey) -> Option<&Account> {
-        if let Some(account) = self.accounts.get(pubkey) {
+    pub fn load(&self, pubkey: &Pubkey) -> Option<Account> {
+        let dir = to_dir_index(pubkey.as_ref()[0]);
+        let reader = &self.accounts_rw[dir];
+        if let Some(index) = self.index[dir].get(pubkey) {
+            let account = reader.get_account(*index).unwrap();
             return Some(account);
         }
 
-        for (accounts, _) in &self.checkpoints {
-            if let Some(account) = accounts.get(pubkey) {
+        for (index, _, accounts_rw, _) in &self.checkpoints {
+            let reader = &accounts_rw[dir];
+            if let Some(index) = index[dir].get(pubkey) {
+                let account = reader.get_account(*index).unwrap();
                 return Some(account);
             }
         }
@@ -101,16 +272,30 @@ impl AccountsDB {
     }
 
     pub fn store(&mut self, pubkey: &Pubkey, account: &Account) {
-        if account.tokens == 0 {
-            if self.checkpoints.is_empty() {
-                // purge if balance is 0 and no checkpoints
-                self.accounts.remove(pubkey);
-            } else {
-                // store default account if balance is 0 and there's a checkpoint
-                self.accounts.insert(pubkey.clone(), Account::default());
+        let dir = to_dir_index(pubkey.as_ref()[0]);
+        let writer = &mut self.accounts_rw[dir];
+        if account.tokens == 0 && self.checkpoints.is_empty() {
+            // purge if balance is 0 and no checkpoints
+            self.index[dir].remove(pubkey);
+            if vote_program::check_id(&account.owner) {
+                self.vote_index[dir].remove(pubkey);
             }
         } else {
-            self.accounts.insert(pubkey.clone(), account.clone());
+            let mut offset: usize;
+            if let Some(index) = self.index[dir].get(pubkey) {
+                offset = *index;
+            } else {
+                offset = std::usize::MAX;
+            }
+            if account.tokens == 0 {
+                offset = writer.write_account(&Account::default(), offset).unwrap();
+            } else {
+                offset = writer.write_account(&account, offset).unwrap();
+            }
+            self.index[dir].insert(*pubkey, offset);
+            if vote_program::check_id(&account.owner) {
+                self.vote_index[dir].insert(*pubkey, offset);
+            }
         }
     }
 
@@ -140,13 +325,18 @@ impl AccountsDB {
         max_age: usize,
         error_counters: &mut ErrorCounters,
     ) -> Result<Vec<Account>> {
+        let mut account = None;
+        if !tx.account_keys.is_empty() {
+            account = self.load(&tx.account_keys[0]);
+        }
+        let mut called_accounts: Vec<Account> = vec![account.clone().unwrap_or_default()];
         // Copy all the accounts
         if tx.signatures.is_empty() && tx.fee != 0 {
             Err(BankError::MissingSignatureForFee)
-        } else if tx.account_keys.is_empty() || self.load(&tx.account_keys[0]).is_none() {
+        } else if account.is_none() {
             error_counters.account_not_found += 1;
             Err(BankError::AccountNotFound)
-        } else if self.load(&tx.account_keys[0]).unwrap().tokens < tx.fee {
+        } else if account.unwrap().tokens < tx.fee {
             error_counters.insufficient_funds += 1;
             Err(BankError::InsufficientFundsForFee)
         } else {
@@ -170,11 +360,13 @@ impl AccountsDB {
                     }
                 })?;
 
-            let mut called_accounts: Vec<Account> = tx
-                .account_keys
-                .iter()
-                .map(|key| self.load(key).cloned().unwrap_or_default())
-                .collect();
+            called_accounts.extend(
+                tx.account_keys
+                    .iter()
+                    .skip(1)
+                    .map(|key| self.load(key).unwrap_or_default())
+                    .collect::<Vec<Account>>(),
+            );
             called_accounts[0].tokens -= tx.fee;
             Ok(called_accounts)
         }
@@ -275,7 +467,7 @@ impl Accounts {
 
     /// Slow because lock is held for 1 operation instead of many
     pub fn load_slow(&self, pubkey: &Pubkey) -> Option<Account> {
-        self.accounts_db.read().unwrap().load(pubkey).cloned()
+        self.accounts_db.read().unwrap().load(pubkey)
     }
 
     /// Slow because lock is held for 1 operation instead of many
@@ -403,34 +595,117 @@ impl Accounts {
 
 impl Checkpoint for AccountsDB {
     fn checkpoint(&mut self) {
-        let mut accounts = HashMap::new();
-        std::mem::swap(&mut self.accounts, &mut accounts);
+        let count = self.checkpoints.len();
+        let tx_count = self.transaction_count();
+        let mut index: Vec<HashMap<Pubkey, usize>> = vec![];
+        let mut vote_index: Vec<HashMap<Pubkey, usize>> = vec![];
+        let mut accounts_rw: Vec<AccountRW> = vec![];
+        ACCOUNT_PATHS.into_iter().for_each(|p| {
+            let from_path = get_path_main!(p);
+            let to_path = get_path_checkpoint!(p, count);
+            let from_path = Path::new(&from_path);
+            let to_path = Path::new(&to_path);
+            let _ignored = remove_dir_all(to_path);
+            create_dir_all(to_path).expect("Create directory failed");
+            rename(from_path, to_path).expect("rename directory failed");
+
+            accounts_rw.push(AccountRW::new(p, true));
+            index.push(HashMap::new());
+            vote_index.push(HashMap::new());
+        });
+        std::mem::swap(&mut self.index, &mut index);
+        std::mem::swap(&mut self.index, &mut vote_index);
+        std::mem::swap(&mut self.accounts_rw, &mut accounts_rw);
 
         self.checkpoints
-            .push_front((accounts, self.transaction_count()));
+            .push_front((index, vote_index, accounts_rw, tx_count));
     }
 
     fn rollback(&mut self) {
-        let (accounts, transaction_count) = self.checkpoints.pop_front().unwrap();
-        self.accounts = accounts;
+        let (index, vote_index, accounts_rw, transaction_count) =
+            self.checkpoints.pop_front().unwrap();
+        let count = self.checkpoints.len();
+        ACCOUNT_PATHS.into_iter().for_each(|p| {
+            let to_path = get_path_main!(p);
+            let from_path = get_path_checkpoint!(p, count);
+            let to_path = Path::new(&to_path);
+            let from_path = Path::new(&from_path);
+            let _ignored = remove_dir_all(to_path);
+            create_dir_all(to_path).expect("Create directory failed");
+            rename(from_path, to_path).expect("rename directory failed");
+        });
+        self.index = index;
+        self.vote_index = vote_index;
+        self.accounts_rw = accounts_rw;
         self.transaction_count = transaction_count;
     }
 
     fn purge(&mut self, depth: usize) {
-        fn merge(into: &mut HashMap<Pubkey, Account>, purge: &mut HashMap<Pubkey, Account>) {
-            purge.retain(|pubkey, _| !into.contains_key(pubkey));
-            into.extend(purge.drain());
-            into.retain(|_, account| account.tokens != 0);
+        fn merge(
+            into_index: &mut Vec<HashMap<Pubkey, usize>>,
+            into_vote_index: &mut Vec<HashMap<Pubkey, usize>>,
+            into_accounts_rw: &mut Vec<AccountRW>,
+            purge_index: &mut Vec<HashMap<Pubkey, usize>>,
+            purge_accounts_rw: &mut Vec<AccountRW>,
+        ) {
+            for (dir, index) in purge_index.iter().enumerate() {
+                let reader = &purge_accounts_rw[dir];
+                let writer = &mut into_accounts_rw[dir];
+                for (pubkey, offset) in index.iter() {
+                    if let Some(_index) = into_index[dir].get(pubkey) {
+                        continue;
+                    }
+                    let account = reader.get_account(*offset).unwrap();
+                    if account.tokens != 0 {
+                        let offset = writer.write_account(&account, std::usize::MAX).unwrap();
+                        into_index[dir].insert(*pubkey, offset);
+                        if vote_program::check_id(&account.owner) {
+                            into_vote_index[dir].insert(*pubkey, offset);
+                        }
+                    }
+                }
+            }
+            let mut pubkeys: Vec<(usize, Pubkey)> = vec![];
+            for (dir, index) in into_index.iter().enumerate() {
+                let reader = &into_accounts_rw[dir];
+                for (pubkey, offset) in index.iter() {
+                    let account = reader.get_account(*offset).unwrap();
+                    if account.tokens == 0 {
+                        pubkeys.push((dir, pubkey.clone()));
+                        if vote_program::check_id(&account.owner) {
+                            into_vote_index[dir].remove(pubkey);
+                        }
+                    }
+                }
+            }
+            for (dir, pubkey) in pubkeys.iter() {
+                into_index[*dir].remove(pubkey);
+            }
         }
 
         while self.depth() > depth {
-            let (mut purge, _) = self.checkpoints.pop_back().unwrap();
+            let (mut purge_index, _, mut purge_accounts_rw, _) =
+                self.checkpoints.pop_back().unwrap();
 
-            if let Some((into, _)) = self.checkpoints.back_mut() {
-                merge(into, &mut purge);
+            if let Some((into_index, into_vote_index, into_accounts_rw, _)) =
+                self.checkpoints.back_mut()
+            {
+                merge(
+                    into_index,
+                    into_vote_index,
+                    into_accounts_rw,
+                    &mut purge_index,
+                    &mut purge_accounts_rw,
+                );
                 continue;
             }
-            merge(&mut self.accounts, &mut purge);
+            merge(
+                &mut self.index,
+                &mut self.vote_index,
+                &mut self.accounts_rw,
+                &mut purge_index,
+                &mut purge_accounts_rw,
+            );
         }
     }
 
@@ -444,6 +719,7 @@ mod tests {
     // TODO: all the bank tests are bank specific, issue: 2194
 
     use super::*;
+    use rand::{thread_rng, Rng};
     use solana_sdk::account::Account;
     use solana_sdk::hash::Hash;
     use solana_sdk::signature::Keypair;
@@ -457,7 +733,7 @@ mod tests {
         error_counters: &mut ErrorCounters,
         max_age: usize,
     ) -> Vec<Result<(InstructionAccounts, InstructionLoaders)>> {
-        let accounts = Accounts::default();
+        let accounts = get_accounts();
         for ka in ka.iter() {
             accounts.store_slow(&ka.0, &ka.1);
         }
@@ -879,5 +1155,101 @@ mod tests {
             }
             Err(e) => Err(e).unwrap(),
         }
+    }
+
+    fn get_accounts() -> &'static Accounts {
+        static mut ACCOUNTS: Option<Accounts> = None;
+        static INIT_ACCOUNTS: std::sync::Once = std::sync::ONCE_INIT;
+        unsafe {
+            INIT_ACCOUNTS.call_once(|| {
+                ACCOUNTS = Some(Accounts::default());
+            });
+            ACCOUNTS.as_ref().unwrap()
+        }
+    }
+
+    fn create_account(accounts: &Accounts, pubkeys: &mut Vec<Pubkey>, num: usize) {
+        for t in 0..num {
+            let pubkey = Keypair::new().pubkey();
+            let mut default_account = Account::default();
+            pubkeys.push(pubkey.clone());
+            default_account.tokens = (t + 1) as u64;
+            assert!(accounts.load_slow(&pubkey).is_none());
+            accounts.store_slow(&pubkey, &default_account);
+        }
+    }
+
+    fn update_accounts(accounts: &Accounts, pubkeys: Vec<Pubkey>, range: usize) {
+        for _ in 1..1000 {
+            let idx = thread_rng().gen_range(0, range);
+            if let Some(mut account) = accounts.load_slow(&pubkeys[idx]) {
+                account.tokens = account.tokens - 1;
+                accounts.store_slow(&pubkeys[idx], &account);
+                if account.tokens == 0 {
+                    assert!(accounts.load_slow(&pubkeys[idx]).is_none());
+                } else {
+                    let mut default_account = Account::default();
+                    default_account.tokens = account.tokens;
+                    assert_eq!(compare_account(&default_account, &account), true);
+                }
+            }
+        }
+    }
+
+    fn compare_account(account1: &Account, account2: &Account) -> bool {
+        if account1.userdata != account2.userdata
+            || account1.owner != account2.owner
+            || account1.executable != account2.executable
+            || account1.loader != account2.loader
+            || account1.tokens != account2.tokens
+        {
+            return false;
+        }
+        true
+    }
+
+    #[test]
+    fn test_account_one() {
+        let accounts = get_accounts();
+        let mut pubkeys: Vec<Pubkey> = vec![];
+        create_account(accounts, &mut pubkeys, 1);
+        let account = accounts.load_slow(&pubkeys[0]).unwrap();
+        let mut default_account = Account::default();
+        default_account.tokens = 1;
+        assert_eq!(compare_account(&default_account, &account), true);
+    }
+
+    #[test]
+    fn test_account_many() {
+        let accounts = get_accounts();
+        let mut pubkeys: Vec<Pubkey> = vec![];
+        create_account(accounts, &mut pubkeys, 100);
+        for _ in 1..100 {
+            let idx = thread_rng().gen_range(0, 99);
+            let account = accounts.load_slow(&pubkeys[idx]).unwrap();
+            let mut default_account = Account::default();
+            default_account.tokens = (idx + 1) as u64;
+            assert_eq!(compare_account(&default_account, &account), true);
+        }
+    }
+
+    #[test]
+    fn test_account_update() {
+        let accounts = get_accounts();
+        let mut pubkeys: Vec<Pubkey> = vec![];
+        create_account(accounts, &mut pubkeys, 100);
+        update_accounts(accounts, pubkeys, 99);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_grow_file() {
+        let accounts = get_accounts();
+        let mut pubkeys: Vec<Pubkey> = vec![];
+        let account = Account::default();
+        let len = serialized_size(&account).unwrap();
+        let num_accounts: usize = ((DATA_FILE_START_SIZE / len) * 2) as usize;
+        create_account(accounts, &mut pubkeys, num_accounts);
+        update_accounts(accounts, pubkeys, num_accounts);
     }
 }

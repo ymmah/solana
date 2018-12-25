@@ -81,6 +81,8 @@ extern crate hex_literal;
 #[macro_use]
 extern crate log;
 
+extern crate memmap;
+
 #[macro_use]
 extern crate serde_derive;
 #[macro_use]
